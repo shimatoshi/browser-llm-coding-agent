@@ -278,6 +278,26 @@ def execute_tools(tool_calls: list, explore_count: int, repeat_tracker: dict) ->
     return results, done, explore_count
 
 
+def try_auto_repair():
+    """Run auto_update to refresh signature secret on auth failure."""
+    try:
+        from auto_update import fetch_page, extract_bundle_urls, find_signature_secret, update_config
+        print("  [Auto-repairing: fetching latest config...]")
+        html = fetch_page()
+        urls = extract_bundle_urls(html)
+        info = find_signature_secret(urls)
+        if info["secret"]:
+            update_config(info["secret"], info["bundle_version"])
+            # Reload the secret in minimax_client
+            import minimax_client
+            minimax_client.SIGNATURE_SECRET = info["secret"]
+            print(f"  [Repaired: secret={info['secret'][:20]}...]")
+            return True
+    except Exception as e:
+        print(f"  [Auto-repair failed: {e}]")
+    return False
+
+
 def call_llm(history: list) -> str:
     """Build prompt from history, compact if needed, call MiniMax."""
     prompt = "\n\n".join(history)
@@ -287,7 +307,14 @@ def call_llm(history: list) -> str:
         prompt = "\n\n".join(history)
         print("  [history compacted]")
 
-    return send_message(prompt)
+    try:
+        return send_message(prompt)
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "403" in err or "signature" in err.lower():
+            if try_auto_repair():
+                return send_message(prompt)  # Retry after repair
+        raise
 
 
 def main():
