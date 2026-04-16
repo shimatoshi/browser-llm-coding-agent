@@ -193,8 +193,10 @@ def resolve_path(p: str) -> str:
 # --- Tool Call Parser ---
 
 def parse_tool_calls(text: str) -> list:
-    """Extract tool calls from LLM response."""
+    """Extract tool calls from LLM response. Handles multiple formats."""
     calls = []
+
+    # Format 1: <tool_call>{"name": ..., "args": ...}</tool_call>
     for match in re.finditer(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL):
         try:
             call = json.loads(match.group(1))
@@ -202,44 +204,141 @@ def parse_tool_calls(text: str) -> list:
                 calls.append(call)
         except json.JSONDecodeError:
             pass
+
+    if calls:
+        return calls
+
+    # Format 2: ```tool_call or ```json blocks with tool call structure
+    for match in re.finditer(r'```(?:tool_call|json)?\s*\n(\{.*?\})\s*\n```', text, re.DOTALL):
+        try:
+            call = json.loads(match.group(1))
+            if "name" in call and "args" in call:
+                calls.append(call)
+        except json.JSONDecodeError:
+            pass
+
+    if calls:
+        return calls
+
+    # Format 3: Inline JSON with "name" and "args" keys
+    for match in re.finditer(r'(\{"name"\s*:\s*"(?:read_file|write_file|edit_file|execute_command|list_directory|find_files|search_text|task_complete)".*?\})', text, re.DOTALL):
+        try:
+            call = json.loads(match.group(1))
+            if "name" in call:
+                calls.append(call)
+        except json.JSONDecodeError:
+            pass
+
     return calls
 
 
 # --- Agent Loop ---
 
-def run_agent(task: str):
-    """Main agent loop."""
-    history = []
-    explore_count = 0
-    repeat_tracker = {}
+def execute_tools(tool_calls: list, explore_count: int, repeat_tracker: dict) -> tuple:
+    """Execute parsed tool calls. Returns (results_list, is_done, explore_count)."""
+    results = []
+    done = False
 
+    for call in tool_calls:
+        name = call["name"]
+        args = call.get("args", {})
+
+        # Explore budget
+        if name in EXPLORE_TOOLS:
+            explore_count += 1
+            if explore_count > EXPLORE_BUDGET:
+                results.append(f"[Tool {name}] Budget exceeded ({EXPLORE_BUDGET} explore calls). Make changes or finish.")
+                continue
+
+        # Loop detection
+        call_key = f"{name}:{json.dumps(args, sort_keys=True)}"
+        repeat_tracker[call_key] = repeat_tracker.get(call_key, 0) + 1
+        if repeat_tracker[call_key] > 2:
+            results.append(f"[Tool {name}] Blocked: identical call repeated 3 times.")
+            continue
+
+        fn = TOOL_MAP.get(name)
+        if not fn:
+            results.append(f"[Tool {name}] Unknown tool")
+            continue
+
+        print(f"  > {name}({json.dumps(args, ensure_ascii=False)[:100]})")
+        result = fn(args)
+
+        if name == "task_complete" and result.get("done"):
+            print(f"\n[Done] {result.get('summary', '')}")
+            done = True
+            break
+
+        result_str = json.dumps(result, ensure_ascii=False)
+        if len(result_str) > 15000:
+            result_str = result_str[:15000] + "...(truncated)"
+        results.append(f"[Tool Result: {name}]\n{result_str}")
+
+    return results, done, explore_count
+
+
+def call_llm(history: list) -> str:
+    """Build prompt from history, compact if needed, call MiniMax."""
+    prompt = "\n\n".join(history)
+
+    if len(prompt) > 80000:
+        history[:] = history[:1] + history[-8:]
+        prompt = "\n\n".join(history)
+        print("  [history compacted]")
+
+    return send_message(prompt)
+
+
+def main():
+    load_config()
+
+    history = []
     system = SYSTEM_PROMPT.replace("{cwd}", CWD)
     history.append(f"[System]\n{system}")
-    history.append(f"[User]\n{task}")
 
-    print(f"\n{'='*60}")
-    print(f"Task: {task}")
-    print(f"Working directory: {CWD}")
-    print(f"{'='*60}\n")
+    explore_count = 0
+    repeat_tracker = {}
+    auto_continue = False  # True when agent is mid-task (tools were called)
 
-    for turn in range(MAX_TURNS):
-        # Build prompt from history
-        prompt = "\n\n".join(history)
+    print(f"MiniMax M2.7 Coding Agent")
+    print(f"cwd: {CWD}")
+    print(f"Type 'exit' to quit, Ctrl+C to interrupt\n")
 
-        # Compact if too long
-        if len(prompt) > 80000:
-            # Keep system + user task + last 6 entries
-            history = history[:2] + history[-6:]
-            prompt = "\n\n".join(history)
-            print("  [history compacted]", file=sys.stderr)
-
-        # Call MiniMax
-        print(f"--- Turn {turn + 1}/{MAX_TURNS} ---", file=sys.stderr)
+    # Get first user input or from argv
+    if len(sys.argv) > 1:
+        user_input = " ".join(sys.argv[1:])
+        print(f"> {user_input}\n")
+    else:
         try:
-            response = send_message(prompt)
+            user_input = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            return
+        if user_input.strip().lower() in ('exit', 'quit', 'q'):
+            return
+
+    history.append(f"[User]\n{user_input}")
+
+    while True:
+        # Call LLM
+        try:
+            response = call_llm(history)
+        except KeyboardInterrupt:
+            print("\n[Interrupted]")
+            auto_continue = False
+            try:
+                user_input = input("\n> ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye!")
+                break
+            if user_input.strip().lower() in ('exit', 'quit', 'q'):
+                break
+            history.append(f"[User]\n{user_input}")
+            continue
         except Exception as e:
-            print(f"API Error: {e}", file=sys.stderr)
-            time.sleep(5)
+            print(f"\n[API Error: {e}]")
+            time.sleep(3)
             continue
 
         history.append(f"[Assistant]\n{response}")
@@ -247,97 +346,48 @@ def run_agent(task: str):
         # Parse tool calls
         tool_calls = parse_tool_calls(response)
 
-        if not tool_calls:
-            # No tool calls - print response and wait for user
-            print(f"\n{response}\n")
-            # Check if the model thinks it's done
-            if any(phrase in response.lower() for phrase in ["task is complete", "task_complete", "all done", "finished"]):
-                print("\n[Agent finished]")
-                break
-            # If no tool calls and not done, ask the model to continue
-            history.append("[User]\nContinue with the task. Use tools to make progress.")
-            continue
-
-        # Execute tool calls
-        results = []
-        done = False
-
-        # Print non-tool-call text
+        # Print the text part (strip tool_call blocks)
         clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL).strip()
         if clean_text:
             print(f"\n{clean_text}")
 
-        for call in tool_calls:
-            name = call["name"]
-            args = call.get("args", {})
+        if tool_calls:
+            # Execute tools automatically
+            results, done, explore_count = execute_tools(tool_calls, explore_count, repeat_tracker)
+            explore_count = 0  # Reset per turn
 
-            # Explore budget
-            if name in EXPLORE_TOOLS:
-                explore_count += 1
-                if explore_count > EXPLORE_BUDGET:
-                    results.append(f"[Tool {name}] Budget exceeded ({EXPLORE_BUDGET} explore calls per turn). Make changes or finish.")
-                    continue
-
-            # Loop detection
-            call_key = f"{name}:{json.dumps(args, sort_keys=True)}"
-            repeat_tracker[call_key] = repeat_tracker.get(call_key, 0) + 1
-            if repeat_tracker[call_key] > 2:
-                results.append(f"[Tool {name}] Blocked: identical call repeated 3 times. Try a different approach.")
+            if done:
+                auto_continue = False
+                # After task_complete, wait for new input
+                try:
+                    user_input = input("\n> ")
+                except (EOFError, KeyboardInterrupt):
+                    print("\nBye!")
+                    break
+                if user_input.strip().lower() in ('exit', 'quit', 'q'):
+                    break
+                history.append(f"[User]\n{user_input}")
                 continue
 
-            # Execute
-            fn = TOOL_MAP.get(name)
-            if not fn:
-                results.append(f"[Tool {name}] Unknown tool")
-                continue
+            # Feed results back and auto-continue
+            if results:
+                history.append("[Tool Results]\n" + "\n\n".join(results))
+            auto_continue = True
+            continue
 
-            print(f"  > {name}({json.dumps(args)[:100]})", file=sys.stderr)
-            result = fn(args)
-
-            if name == "task_complete" and result.get("done"):
-                print(f"\n[Task Complete] {result.get('summary', '')}")
-                done = True
-                break
-
-            # Format result
-            result_str = json.dumps(result, ensure_ascii=False)
-            if len(result_str) > 15000:
-                result_str = result_str[:15000] + "...(truncated)"
-            results.append(f"[Tool Result: {name}]\n{result_str}")
-
-        if done:
-            break
-
-        # Reset explore budget each turn
-        explore_count = 0
-
-        # Feed results back
-        if results:
-            history.append("[Tool Results]\n" + "\n\n".join(results))
-    else:
-        print(f"\n[Agent stopped: max turns ({MAX_TURNS}) reached]")
-
-
-def main():
-    load_config()
-
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        run_agent(task)
-    else:
-        print("MiniMax M2.7 Coding Agent (type 'exit' to quit)")
-        print("=" * 50)
-        while True:
+        else:
+            # No tool calls = conversational response. Wait for user.
+            auto_continue = False
             try:
-                task = input("\nTask> ")
+                user_input = input("\n> ")
             except (EOFError, KeyboardInterrupt):
                 print("\nBye!")
                 break
-            if task.strip().lower() in ('exit', 'quit', 'q'):
+            if user_input.strip().lower() in ('exit', 'quit', 'q'):
                 break
-            if not task.strip():
+            if not user_input.strip():
                 continue
-            run_agent(task)
+            history.append(f"[User]\n{user_input}")
 
 
 if __name__ == "__main__":
