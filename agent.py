@@ -317,6 +317,189 @@ def call_llm(history: list) -> str:
         raise
 
 
+# --- Slash Commands ---
+
+def cmd_account(args: str):
+    """Manage accounts. /account add | list | switch N | remove N"""
+    from minimax_client import _accounts, _account_index, _activate_account, CONFIG_PATH
+
+    parts = args.strip().split()
+    sub = parts[0] if parts else "list"
+
+    if sub == "list":
+        for i, acct in enumerate(_accounts):
+            marker = " *" if i == _account_index else "  "
+            uid = acct.get("real_user_id", "?")
+            # Decode name from JWT
+            name = "?"
+            try:
+                payload = json.loads(base64.b64decode(acct["token"].split('.')[1] + '=='))
+                name = payload.get("user", {}).get("name", "?")
+            except Exception:
+                pass
+            print(f"{marker}[{i + 1}] {name} (uid: {uid})")
+
+    elif sub == "add":
+        print("Paste JWT token (_token from localStorage):")
+        try:
+            token = input("  token> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not token:
+            return
+        print("Paste realUserID (from user_detail_agent.realUserID):")
+        try:
+            real_user_id = input("  real_user_id> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not real_user_id:
+            return
+
+        device_id = "0"
+        try:
+            payload = json.loads(base64.b64decode(token.split('.')[1] + '=='))
+            device_id = str(payload.get("user", {}).get("deviceID", "0"))
+            name = payload.get("user", {}).get("name", "unknown")
+        except Exception:
+            name = "unknown"
+
+        new_acct = {"token": token, "real_user_id": real_user_id, "device_id": device_id}
+        _accounts.append(new_acct)
+        _save_accounts()
+        print(f"  Added account: {name} (total: {len(_accounts)})")
+
+    elif sub == "switch" and len(parts) > 1:
+        try:
+            idx = int(parts[1]) - 1
+            if 0 <= idx < len(_accounts):
+                _activate_account(idx)
+                print(f"  Switched to account {idx + 1}")
+            else:
+                print(f"  Invalid index. Use 1-{len(_accounts)}")
+        except ValueError:
+            print("  Usage: /account switch N")
+
+    elif sub == "remove" and len(parts) > 1:
+        try:
+            idx = int(parts[1]) - 1
+            if 0 <= idx < len(_accounts):
+                removed = _accounts.pop(idx)
+                _save_accounts()
+                if _account_index >= len(_accounts):
+                    _activate_account(0)
+                print(f"  Removed account {idx + 1}")
+            else:
+                print(f"  Invalid index. Use 1-{len(_accounts)}")
+        except ValueError:
+            print("  Usage: /account remove N")
+
+    else:
+        print("Usage: /account [list|add|switch N|remove N]")
+
+
+def _save_accounts():
+    """Write current accounts list back to config.json."""
+    from minimax_client import _accounts, CONFIG_PATH, SIGNATURE_SECRET
+
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+
+    cfg["accounts"] = [
+        {"token": a["token"], "real_user_id": a["real_user_id"], "device_id": a.get("device_id", "0")}
+        for a in _accounts
+    ]
+    cfg["signature_secret"] = SIGNATURE_SECRET
+
+    # Remove old single-account fields if accounts array exists
+    for key in ("token", "real_user_id", "device_id"):
+        cfg.pop(key, None)
+
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=4)
+
+
+def cmd_update(_args: str):
+    """Run auto_update to refresh signature secret."""
+    try_auto_repair()
+
+
+def cmd_status(_args: str):
+    """Show current status."""
+    from minimax_client import _accounts, _account_index, SIGNATURE_SECRET
+    acct = _accounts[_account_index]
+    name = "?"
+    try:
+        payload = json.loads(base64.b64decode(acct["token"].split('.')[1] + '=='))
+        name = payload.get("user", {}).get("name", "?")
+        exp = payload.get("exp", 0)
+        import datetime
+        exp_str = datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d")
+    except Exception:
+        exp_str = "?"
+    print(f"  Account: {name} ({_account_index + 1}/{len(_accounts)})")
+    print(f"  Token expires: {exp_str}")
+    print(f"  Secret: {SIGNATURE_SECRET[:20]}...")
+    print(f"  CWD: {CWD}")
+
+
+def cmd_help(_args: str):
+    """Show available slash commands."""
+    print("  /account [list|add|switch N|remove N]  Manage accounts")
+    print("  /status                                Show current status")
+    print("  /update                                Refresh signature secret")
+    print("  /clear                                 Clear conversation history")
+    print("  /help                                  Show this help")
+    print("  exit                                   Quit")
+
+
+def cmd_clear(_args: str):
+    """Clear conversation history."""
+    # Signal handled in main loop via return value
+    print("  [History cleared]")
+
+
+SLASH_COMMANDS = {
+    "account": cmd_account,
+    "status": cmd_status,
+    "update": cmd_update,
+    "clear": cmd_clear,
+    "help": cmd_help,
+}
+
+
+def handle_input(prompt_str: str = "\n> ") -> str:
+    """Get user input. Returns None on exit, handles slash commands."""
+    try:
+        user_input = input(prompt_str)
+    except (EOFError, KeyboardInterrupt):
+        print("\nBye!")
+        return None
+
+    stripped = user_input.strip()
+    if stripped.lower() in ('exit', 'quit', 'q'):
+        return None
+
+    # Slash commands
+    if stripped.startswith("/"):
+        parts = stripped[1:].split(None, 1)
+        cmd_name = parts[0].lower() if parts else ""
+        cmd_args = parts[1] if len(parts) > 1 else ""
+        handler = SLASH_COMMANDS.get(cmd_name)
+        if handler:
+            handler(cmd_args)
+            if cmd_name == "clear":
+                return "__clear__"
+            return ""  # Empty = don't send to LLM, prompt again
+        else:
+            print(f"  Unknown command: /{cmd_name}. Type /help")
+            return ""
+
+    return user_input
+
+
 def main():
     load_config()
 
@@ -326,23 +509,20 @@ def main():
 
     explore_count = 0
     repeat_tracker = {}
-    auto_continue = False  # True when agent is mid-task (tools were called)
 
     print(f"MiniMax M2.7 Coding Agent")
     print(f"cwd: {CWD}")
-    print(f"Type 'exit' to quit, Ctrl+C to interrupt\n")
+    print(f"Type /help for commands, 'exit' to quit\n")
 
     # Get first user input or from argv
     if len(sys.argv) > 1:
         user_input = " ".join(sys.argv[1:])
         print(f"> {user_input}\n")
     else:
-        try:
-            user_input = input("> ")
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            return
-        if user_input.strip().lower() in ('exit', 'quit', 'q'):
+        user_input = handle_input("> ")
+        while user_input is not None and not user_input.strip():
+            user_input = handle_input("> ")
+        if user_input is None:
             return
 
     history.append(f"[User]\n{user_input}")
@@ -353,14 +533,11 @@ def main():
             response = call_llm(history)
         except KeyboardInterrupt:
             print("\n[Interrupted]")
-            auto_continue = False
-            try:
-                user_input = input("\n> ")
-            except (EOFError, KeyboardInterrupt):
-                print("\nBye!")
+            user_input = handle_input()
+            if user_input is None:
                 break
-            if user_input.strip().lower() in ('exit', 'quit', 'q'):
-                break
+            if not user_input.strip():
+                continue
             history.append(f"[User]\n{user_input}")
             continue
         except Exception as e:
@@ -379,40 +556,33 @@ def main():
             print(f"\n{clean_text}")
 
         if tool_calls:
-            # Execute tools automatically
             results, done, explore_count = execute_tools(tool_calls, explore_count, repeat_tracker)
-            explore_count = 0  # Reset per turn
+            explore_count = 0
 
             if done:
-                auto_continue = False
-                # After task_complete, wait for new input
-                try:
-                    user_input = input("\n> ")
-                except (EOFError, KeyboardInterrupt):
-                    print("\nBye!")
+                user_input = handle_input()
+                if user_input is None:
                     break
-                if user_input.strip().lower() in ('exit', 'quit', 'q'):
-                    break
+                if not user_input.strip():
+                    continue
                 history.append(f"[User]\n{user_input}")
                 continue
 
-            # Feed results back and auto-continue
             if results:
                 history.append("[Tool Results]\n" + "\n\n".join(results))
-            auto_continue = True
             continue
 
         else:
-            # No tool calls = conversational response. Wait for user.
-            auto_continue = False
-            try:
-                user_input = input("\n> ")
-            except (EOFError, KeyboardInterrupt):
-                print("\nBye!")
-                break
-            if user_input.strip().lower() in ('exit', 'quit', 'q'):
+            # Conversational response. Wait for user.
+            user_input = handle_input()
+            if user_input is None:
                 break
             if not user_input.strip():
+                continue
+            # /clear command
+            if user_input.strip() == "__clear__":
+                history = [history[0]]
+                print("  [History cleared]")
                 continue
             history.append(f"[User]\n{user_input}")
 
