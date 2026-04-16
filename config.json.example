@@ -1,0 +1,5 @@
+{
+    "token": "eyJ... (JWT from localStorage._token after logging in to agent.minimax.io)",
+    "real_user_id": "501... (from localStorage.user_detail_agent.realUserID)",
+    "device_id": "86642953 (from JWT payload user.deviceID)"
+}
