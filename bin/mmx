@@ -1,0 +1,9 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""mmx - MiniMax coding agent. Run from anywhere."""
+import os, sys
+
+os.environ["MMX_CWD"] = os.getcwd()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+
+from agent import main
+main()

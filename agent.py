@@ -20,7 +20,7 @@ from minimax_client import load_config, send_message
 # --- Constants ---
 MAX_TURNS = 30
 EXPLORE_BUDGET = 12
-CWD = os.getcwd()
+CWD = os.environ.get("MMX_CWD", os.getcwd())
 
 SYSTEM_PROMPT = """You are a coding agent running in a terminal on Android (Termux).
 You have access to the following tools. To use a tool, output a tool call block in this exact format:

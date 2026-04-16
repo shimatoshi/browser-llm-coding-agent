@@ -10,6 +10,7 @@ Usage:
 
 import json
 import hashlib
+import os
 import time
 import sys
 import base64
@@ -35,8 +36,14 @@ POLL_INTERVAL = 2
 def load_config():
     """Load token from config file if exists."""
     global TOKEN, REAL_USER_ID, DEVICE_ID
+    # Look for config.json next to this script, then in CWD
+    config_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+        "config.json",
+    ]
+    config_path = next((p for p in config_paths if os.path.exists(p)), None)
     try:
-        with open("config.json") as f:
+        with open(config_path) as f:
             cfg = json.load(f)
             TOKEN = cfg.get("token", TOKEN)
             REAL_USER_ID = cfg.get("real_user_id", REAL_USER_ID)
