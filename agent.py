@@ -184,6 +184,29 @@ def resolve_path(p: str) -> str:
 
 # --- Tool Call Parser ---
 
+TOOL_NAMES = {"read_file", "write_file", "edit_file", "execute_command",
+              "list_directory", "find_files", "search_text", "task_complete"}
+
+# Map from XML-style parameter names to our arg names
+XML_PARAM_MAP = {
+    "file_path": "path", "path": "path", "content": "content",
+    "old_string": "old_string", "new_string": "new_string",
+    "command": "command", "pattern": "pattern", "glob": "glob",
+    "summary": "summary",
+}
+# Map from XML invoke names to our tool names
+XML_NAME_MAP = {
+    "read": "read_file", "read_file": "read_file",
+    "write": "write_file", "write_file": "write_file",
+    "edit": "edit_file", "edit_file": "edit_file",
+    "execute": "execute_command", "execute_command": "execute_command",
+    "list": "list_directory", "list_directory": "list_directory",
+    "find": "find_files", "find_files": "find_files",
+    "search": "search_text", "search_text": "search_text",
+    "task_complete": "task_complete",
+}
+
+
 def parse_tool_calls(text: str) -> list:
     """Extract tool calls from LLM response. Handles multiple formats."""
     calls = []
@@ -200,7 +223,31 @@ def parse_tool_calls(text: str) -> list:
     if calls:
         return calls
 
-    # Format 2: ```tool_call or ```json blocks with tool call structure
+    # Format 2: XML invoke style (Anthropic-like)
+    # <invoke name="write_file"><parameter name="path">...</parameter>...</invoke>
+    # Also handles <invoke name="write"> variant
+    for match in re.finditer(
+        r'<invoke\s+name="(\w+)">(.*?)</invoke>', text, re.DOTALL
+    ):
+        invoke_name = match.group(1)
+        tool_name = XML_NAME_MAP.get(invoke_name)
+        if not tool_name:
+            continue
+        body = match.group(2)
+        args = {}
+        for pmatch in re.finditer(
+            r'<parameter\s+name="(\w+)">(.*?)</parameter>', body, re.DOTALL
+        ):
+            param_name = pmatch.group(1)
+            param_val = pmatch.group(2).strip()
+            mapped = XML_PARAM_MAP.get(param_name, param_name)
+            args[mapped] = param_val
+        calls.append({"name": tool_name, "args": args})
+
+    if calls:
+        return calls
+
+    # Format 3: ```tool_call or ```json blocks
     for match in re.finditer(r'```(?:tool_call|json)?\s*\n(\{.*?\})\s*\n```', text, re.DOTALL):
         try:
             call = json.loads(match.group(1))
@@ -212,8 +259,11 @@ def parse_tool_calls(text: str) -> list:
     if calls:
         return calls
 
-    # Format 3: Inline JSON with "name" and "args" keys
-    for match in re.finditer(r'(\{"name"\s*:\s*"(?:read_file|write_file|edit_file|execute_command|list_directory|find_files|search_text|task_complete)".*?\})', text, re.DOTALL):
+    # Format 4: Inline JSON
+    for match in re.finditer(
+        r'(\{"name"\s*:\s*"(?:' + "|".join(TOOL_NAMES) + r')".*?\})',
+        text, re.DOTALL
+    ):
         try:
             call = json.loads(match.group(1))
             if "name" in call:
@@ -542,8 +592,10 @@ def main():
         # Parse tool calls
         tool_calls = parse_tool_calls(response)
 
-        # Print the text part (strip tool_call blocks and role tags)
+        # Print the text part (strip tool_call blocks, XML invokes, and role tags)
         clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL)
+        clean_text = re.sub(r'<invoke\s+name="[^"]*">.*?</invoke>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'</(?:minimax:)?tool_call>', '', clean_text)
         clean_text = re.sub(r'<</?(?:SYSTEM|USER|ASSISTANT|RESULT)>>', '', clean_text).strip()
         if clean_text:
             print(f"\n{clean_text}")
