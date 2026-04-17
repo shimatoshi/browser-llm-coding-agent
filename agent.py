@@ -22,47 +22,39 @@ MAX_TURNS = 30
 EXPLORE_BUDGET = 12
 CWD = os.environ.get("MMX_CWD", os.getcwd())
 
-SYSTEM_PROMPT = """You are a coding agent running in a terminal on Android (Termux).
-You have access to the following tools. To use a tool, output a tool call block in this exact format:
+SYSTEM_PROMPT = """You are a coding agent. You work in: {cwd}
+
+# TOOL FORMAT (CRITICAL)
+To use a tool, you MUST output EXACTLY this format. No other format is accepted:
 
 <tool_call>
-{"name": "tool_name", "args": {"arg1": "value1"}}
+{"name": "TOOL_NAME", "args": {"key": "value"}}
 </tool_call>
 
-Available tools:
+WRONG (will be ignored):
+- ```json {"name": ...} ```
+- [tool_call] ...
+- Bare JSON without <tool_call> tags
+- Tool calls inside code blocks
 
-1. read_file: Read a file's contents
-   args: {"path": "relative/or/absolute/path"}
+# TOOLS
 
-2. write_file: Write content to a file (creates dirs if needed)
-   args: {"path": "path", "content": "file content"}
+read_file {"path": "file.py"}
+write_file {"path": "file.py", "content": "..."}
+edit_file {"path": "file.py", "old_string": "before", "new_string": "after"}
+execute_command {"command": "npm install"}
+list_directory {"path": "."}
+find_files {"pattern": "**/*.py"}
+search_text {"pattern": "TODO", "path": "src/"}
+task_complete {"summary": "what was done"}
 
-3. edit_file: Replace a string in a file
-   args: {"path": "path", "old_string": "text to find", "new_string": "replacement text"}
-
-4. execute_command: Run a shell command
-   args: {"command": "shell command here"}
-
-5. list_directory: List files in a directory
-   args: {"path": "directory path"}
-
-6. find_files: Find files matching a glob pattern
-   args: {"pattern": "**/*.py", "path": "optional/base/dir"}
-
-7. search_text: Search for text/regex in files
-   args: {"pattern": "search regex", "path": "optional/base/dir", "glob": "optional file glob"}
-
-8. task_complete: Signal that the task is done
-   args: {"summary": "what was accomplished"}
-
-Rules:
-- Always read a file before editing it.
-- Use execute_command for builds, tests, git, etc.
-- Work in the current directory: {cwd}
-- You can call multiple tools in sequence in a single response.
-- After executing tools, you'll receive the results. Use them to decide next steps.
-- When the task is fully complete, call task_complete.
-- Be concise in explanations. Focus on doing, not talking.
+# RULES
+- Read before edit. Always.
+- One tool per <tool_call> block. Multiple blocks OK.
+- Tool results appear as [RESULT tool_name] ... [/RESULT]. Never generate these yourself.
+- Keep explanations short. Act, don't talk.
+- Never hallucinate tool results. Wait for real ones.
+- When done, call task_complete.
 """.strip()
 
 # --- Tool Implementations ---
@@ -273,7 +265,7 @@ def execute_tools(tool_calls: list, explore_count: int, repeat_tracker: dict) ->
         result_str = json.dumps(result, ensure_ascii=False)
         if len(result_str) > 15000:
             result_str = result_str[:15000] + "...(truncated)"
-        results.append(f"[Tool Result: {name}]\n{result_str}")
+        results.append(f"[RESULT {name}]\n{result_str}\n[/RESULT]")
 
     return results, done, explore_count
 
@@ -505,7 +497,7 @@ def main():
 
     history = []
     system = SYSTEM_PROMPT.replace("{cwd}", CWD)
-    history.append(f"[System]\n{system}")
+    history.append(f"<<SYSTEM>>\n{system}\n<</SYSTEM>>")
 
     explore_count = 0
     repeat_tracker = {}
@@ -525,7 +517,7 @@ def main():
         if user_input is None:
             return
 
-    history.append(f"[User]\n{user_input}")
+    history.append(f"<<USER>>\n{user_input}\n<</USER>>")
 
     while True:
         # Call LLM
@@ -538,20 +530,21 @@ def main():
                 break
             if not user_input.strip():
                 continue
-            history.append(f"[User]\n{user_input}")
+            history.append(f"<<USER>>\n{user_input}\n<</USER>>")
             continue
         except Exception as e:
             print(f"\n[API Error: {e}]")
             time.sleep(3)
             continue
 
-        history.append(f"[Assistant]\n{response}")
+        history.append(f"<<ASSISTANT>>\n{response}\n<</ASSISTANT>>")
 
         # Parse tool calls
         tool_calls = parse_tool_calls(response)
 
-        # Print the text part (strip tool_call blocks)
-        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL).strip()
+        # Print the text part (strip tool_call blocks and role tags)
+        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL)
+        clean_text = re.sub(r'<</?(?:SYSTEM|USER|ASSISTANT|RESULT)>>', '', clean_text).strip()
         if clean_text:
             print(f"\n{clean_text}")
 
@@ -565,11 +558,11 @@ def main():
                     break
                 if not user_input.strip():
                     continue
-                history.append(f"[User]\n{user_input}")
+                history.append(f"<<USER>>\n{user_input}\n<</USER>>")
                 continue
 
             if results:
-                history.append("[Tool Results]\n" + "\n\n".join(results))
+                history.append("\n".join(results))
             continue
 
         else:
@@ -584,7 +577,7 @@ def main():
                 history = [history[0]]
                 print("  [History cleared]")
                 continue
-            history.append(f"[User]\n{user_input}")
+            history.append(f"<<USER>>\n{user_input}\n<</USER>>")
 
 
 if __name__ == "__main__":
